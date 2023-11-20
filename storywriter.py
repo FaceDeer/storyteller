@@ -60,69 +60,14 @@ def countTokens(prompt):
 def sanitize_filename(filename):
     return re.sub(r'(?u)[^-\w.]', '_', filename)
 
-def clear_layout(layout):
-    while layout.count():
-        child = layout.takeAt(0)
-        if child.widget() is not None:
-            child.widget().deleteLater()
-        elif child.layout() is not None:
-            clear_layout(child.layout())
-
-def findLayoutInParent(parentLayout, childLayout):
-    for i in range(parentLayout.count()):
-        layout_item = parentLayout.itemAt(i)
-        if layout_item.layout() == childLayout:
-            return i
-            break
-    return None
-
-
-class EmptyFlaggedLineEdit(QLineEdit):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # Set the initial stylesheet
-        self.update_stylesheet()
-
-    def update_stylesheet(self):
-        if len(self.text()) > 0:
-            # If the text is set, use a default border
-            self.setStyleSheet("border: 1px solid black")
-        else:
-            # If the text is not set, use a red border
-            self.setStyleSheet("border: 1px solid red")
-
-    def setText(self, text):
-        super().setText(text)
-        self.update_stylesheet()
-
-class EmptyFlaggedTextEdit(QTextEdit):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # Set the initial stylesheet
-        self.update_stylesheet()
-
-    def update_stylesheet(self):
-        if len(self.toPlainText()) > 0:
-            # If the text is set, use a default border
-            self.setStyleSheet("border: 1px solid black")
-        else:
-            # If the text is not set, use a red border
-            self.setStyleSheet("border: 1px solid red")
-
-    def setPlainText(self, text):
-        super().setPlainText(text)
-        self.update_stylesheet()
-
-
 #Note to self: update Scene to have a root widget rather than adding things directly to its layout
-class Scene:
+class Scene(QWidget):
     def __init__(self, parentChapter, sceneData=None):
+        super().__init__()
         self.parentChapter = parentChapter
         self.layout = QVBoxLayout()
-        self.parentChapter.scenes.append(self)
-        self.parentChapter.scenesLayout.addLayout(self.layout)
+        self.setLayout(self.layout)
+        self.parentChapter.scenesLayout.addWidget(self)
 
         self.textLayout = QGridLayout()
         self.summary = QTextEdit()
@@ -146,6 +91,13 @@ It is also used when generating later scenes in this chapter as part of the summ
         
         buttons = QHBoxLayout()
 
+        self.move_up = QPushButton("Move up")
+        self.move_up.clicked.connect(self.moveSceneUp)
+        buttons.addWidget(self.move_up)
+        self.move_down = QPushButton("Move down")
+        self.move_down.clicked.connect(self.moveSceneDown)
+        buttons.addWidget(self.move_down)
+
         self.generate_button = QPushButton('Generate text of this scene')
         self.generate_button.clicked.connect(self.generateScene)
         buttons.addWidget(self.generate_button)
@@ -161,29 +113,22 @@ It is also used when generating later scenes in this chapter as part of the summ
             self.text.setPlainText(sceneData["text"])
 
     def deleteScene(self):
-        parentLayout = self.parentChapter.scenesLayout
-        index = findLayoutInParent(parentLayout, self.layout)
-        if index is None:
-            return
-        layout_item = parentLayout.takeAt(index)
-        clear_layout(layout_item)
-        del layout_item
-        del self.parentChapter.scenes[index]
+        self.parentChapter.scenesLayout.removeWidget(self)
         self.parentChapter.parentStory.update()
+        self.deleteLater()
         return
 
     def generateScene(self):
-        scene = self
-        chapter = scene.parentChapter
+        chapter = self.parentChapter
         story = chapter.parentStory
         chapter_index = None
         scene_index = None
-        for i in range(len(story.chapters)):
-            if story.chapters[i] == chapter:
+        for i in range(story.chapterLayout.count()):
+            if story.chapterLayout.itemAt(i).widget() == chapter:
                 chapter_index= i
                 break
-        for i in range(len(chapter.scenes)):
-            if chapter.scenes[i] == scene:
+        for i in range(chapter.scenesLayout.count()):
+            if chapter.scenesLayout.itemAt(i).widget() == self:
                 scene_index = i
                 break
 
@@ -195,32 +140,63 @@ It is also used when generating later scenes in this chapter as part of the summ
             prompt = prompt + "\n\nGeneral background information: " + story.summary.toPlainText()
         prompt = prompt + "\n\nThe story so far has had the following major events happen:"
         for c in range(chapter_index + 1):
-            chapter = story.chapters[c]
+            chapter = story.chapterLayout.itemAt(c).widget()
             prompt = prompt + "\n\n" + chapter.summary.toPlainText()
         prompt = prompt + "\n\nThe current chapter is titled \"" + chapter.title.text() + "\""
         if scene_index > 1:
             prompt = prompt + "\n\nThe following scenes have already happened in this chapter:"
             for s in range(scene_index-1):
-                prompt = prompt + "\n" + chapter.scenes[s].summary.toPlainText()
+                prompt = prompt + "\n" + chapter.scenesLayout.itemAt(s).widget().summary.toPlainText()
         if scene_index > 0:
-            prompt = prompt +"\n\nThe most recent scene before this one was:\n\n" + chapter.scenes[scene_index-1].text.toPlainText()
+            prompt = prompt +"\n\nThe most recent scene before this one was:\n\n" + chapter.scenesLayout.itemAt(scene_index-1).widget().text.toPlainText()
 
-        prompt = prompt + "\n\nYou are now writing the next scene in which the following occurs: " + scene.summary.toPlainText() \
+        prompt = prompt + "\n\nYou are now writing the next scene in which the following occurs: " + self.summary.toPlainText() \
                  + "\n\nPlease write out this scene.\n{{[OUTPUT]}}"
 
         print(prompt)
-        scene.text.setPlainText(getResult(prompt, None))
+        self.text.setPlainText(getResult(prompt, None))
         return
 
-class Chapter:
+    def moveScene(self, up):
+        chapter = self.parentChapter
+        scene_index = None
+        scene_count = chapter.scenesLayout.count()
+        for i in range(scene_count):
+            if chapter.scenesLayout.itemAt(i).widget() == self:
+                scene_index = i
+                break
+        target = scene_index
+        if up:
+            target = target - 1
+        else:
+            target = target + 1
+        if target < 0 or target >= scene_count or scene_index < 0 or scene_index >= scene_count:
+            return
+        if scene_index > target:
+            scene_index, target = target, scene_index
+        layout = chapter.scenesLayout
+        widget1 = layout.itemAt(scene_index).widget()
+        widget2 = layout.itemAt(target).widget()
+        layout.removeWidget(widget1)
+        layout.removeWidget(widget2)
+        layout.insertWidget(scene_index, widget2)
+        layout.insertWidget(target, widget1)
+        chapter.update()
+        return    
+
+    def moveSceneUp(self):
+        self.moveScene(True)
+    def moveSceneDown(self):
+        self.moveScene(False)
+
+class Chapter(QFrame):
     def __init__(self, parentStory, chapterData=None):
-        self.frame = QFrame()
-        self.frame.setFrameShape(QFrame.Box)
-        self.frame.setLineWidth(1)
+        super().__init__()
+        self.setFrameShape(QFrame.Box)
+        self.setLineWidth(1)
         self.layout = QVBoxLayout()
-        self.frame.setLayout(self.layout)
+        self.setLayout(self.layout)
         self.parentStory = parentStory
-        self.parentStory.chapters.append(self)
         
         title = QFormLayout()
 
@@ -253,10 +229,12 @@ You can use the AI to automatically generate a summary of the previous chapter's
         
         self.layout.addWidget(summaryContainer)
 
-        self.scenes = []
+        self.scenesWidget = QWidget()
         self.scenesLayout = QVBoxLayout()
         self.scenesLayout.setContentsMargins(20,0,0,0)
-        self.layout.addLayout(self.scenesLayout)
+        self.scenesWidget.setLayout(self.scenesLayout)
+        
+        self.layout.addWidget(self.scenesWidget)
 
         buttons = QHBoxLayout()
 
@@ -277,15 +255,14 @@ You can use the AI to automatically generate a summary of the previous chapter's
             for sceneData in chapterData["scenes"]:
                 Scene(self, sceneData)
 
-        self.parentStory.scrollContentLayout.addWidget(self.frame)
-        #self.parentStory.scrollContentLayout.update()
+        self.parentStory.chapterLayout.addWidget(self)
+        #self.parentStory.chapterLayout.update()
         self.parentStory.scrollContent.adjustSize()
 
     def deleteChapter(self):
-        parentLayout = self.parentStory.scrollContentLayout
-        parentLayout.removeWidget(self.frame)
-        self.frame.deleteLater()
-        self.parentStory.chapters.remove(self)
+        parentLayout = self.parentStory.chapterLayout
+        parentLayout.removeWidget(self)
+        self.deleteLater()
         self.parentStory.update()
 
     def addScene(self):
@@ -295,8 +272,8 @@ You can use the AI to automatically generate a summary of the previous chapter's
         chapter = self
         story = chapter.parentStory
         chapter_index = None
-        for i in range(len(story.chapters)):
-            if story.chapters[i] == chapter:
+        for i in range(story.chapterLayout.count()):
+            if story.chapterLayout.itemAt(i).widget() == chapter:
                 chapter_index = i
                 break
         if chapter_index == 0:
@@ -310,8 +287,9 @@ You can use the AI to automatically generate a summary of the previous chapter's
         if len(story.summary.toPlainText()) > 0:
             prompt = prompt + "\nGeneral background information: " + story.summary.toPlainText()
         prompt = prompt + "\n\nThe most recent chapter of the story is:"
-        for scene in story.chapters[chapter_index].scenes:
-            prompt = prompt + "\n\n" + scene.text.toPlainText()
+        scenesLayout = story.chapterLayout.itemAt(chapter_index).widget().scenesLayout
+        for i in range(scenesLayout.count()):
+            prompt = prompt + "\n\n" + scenesLayout.itemAt(i).widget().text.toPlainText()
 
         prompt = prompt + "\n\nPlease summarize this chapter in 200 words or less, focusing on the information that's important for writing future scenes in this story.\n{{[OUTPUT]}}"
 
@@ -346,14 +324,12 @@ class StoryWriter(QWidget):
 
         summary.setToolTip("Background information is always added at the top of prompts sent to the LLM.")
 
-        self.chapters = []
-
         self.scrollArea = QScrollArea(self)
         self.scrollArea.setWidgetResizable(True)
 
         self.scrollContent = QWidget(self.scrollArea)
-        self.scrollContentLayout = QVBoxLayout(self.scrollContent)
-        self.scrollContent.setLayout(self.scrollContentLayout)
+        self.chapterLayout = QVBoxLayout(self.scrollContent)
+        self.scrollContent.setLayout(self.chapterLayout)
         self.scrollArea.setWidget(self.scrollContent)
         self.scrollArea.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         
@@ -396,10 +372,9 @@ class StoryWriter(QWidget):
             return
         self.summary.setPlainText(jsonData["summary"])
         self.title.setText(jsonData["title"])
-        self.chapters = []
         for widget in self.scrollContent.findChildren(QWidget):
             widget.deleteLater()
-        self.scrollContentLayout.update()
+        self.chapterLayout.update()
         for chapterData in jsonData["chapters"]:
             Chapter(self, chapterData)
 
@@ -409,13 +384,15 @@ class StoryWriter(QWidget):
         jsonData["title"] = self.title.text()
         jsonData["summary"] = self.summary.toPlainText()
         jsonData["chapters"] = []
-        for chapter in self.chapters:
+        for i in range(self.chapterLayout.count()):
+            chapter = self.chapterLayout.itemAt(i).widget()
             chapterData = {}
             jsonData["chapters"].append(chapterData)
             chapterData["title"] = chapter.title.text()
             chapterData["summary"] = chapter.summary.toPlainText()
             chapterData["scenes"] = []
-            for scene in chapter.scenes:
+            for i in range(chapter.scenesLayout.count()):
+                scene = chapter.scenesLayout.itemAt(i).widget()
                 sceneData = {}
                 chapterData["scenes"].append(sceneData)
                 sceneData["summary"] = scene.summary.toPlainText()
@@ -429,12 +406,14 @@ class StoryWriter(QWidget):
         with open(filename + ".txt", "w") as f:
             f.write(self.title.text())
             f.write("\n\n")
-            for chapter in self.chapters:
+            for i in range(self.chapterLayout.count()):
+                chapter = self.chapterLayout.itemAt(i).widget()
                 f.write(chapter.title.text())
                 f.write("\n")
                 f.write("="*len(chapter.title.text()))
                 f.write("\n\n")
-                for scene in chapter.scenes:
+                for i in range(chapter.scenesLayout.count()):
+                    scene = chapter.scenesLayout.itemAt(i).widget()
                     f.write(scene.text.toPlainText())
                     f.write("\n\n")
 
