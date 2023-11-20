@@ -5,13 +5,15 @@ import sys
 
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QFormLayout, QGridLayout, QFileDialog, QFrame, QScrollArea, QSizePolicy
 
-
 def excepthook(exc_type, exc_value, exc_tb):
     tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     print("catched:", tb)
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 sys.excepthook = excepthook
+
+# Create a Qt application
+app = QApplication([])
 
 exportedStylesheet = "background-color: rgb(252, 245, 229);"
 
@@ -42,6 +44,7 @@ def getResult(prompt, grammar):
         # Parse the response JSON into a Python dictionary
         response_data = json.loads(response.text)
         #print(response_data)
+        app.beep()
         return response_data["results"][0]["text"].strip()
     else:
         print(f"Request failed with status code {response.status_code}")
@@ -134,10 +137,10 @@ It is also used when generating later scenes in this chapter as part of the summ
         self.text = QTextEdit()
         self.text.setPlaceholderText("Text")
         self.text.setStyleSheet(exportedStylesheet)
+        self.text.setToolTip("""This is the finished output text for this story.""")
+
         self.textLayout.addWidget(QLabel("Text"),0,1)
         self.textLayout.addWidget(self.text,1,1)
-
-        self.text.setToolTip("""This is the finished output text for this story.""")
 
         self.layout.addLayout(self.textLayout)
         
@@ -184,8 +187,8 @@ It is also used when generating later scenes in this chapter as part of the summ
                 scene_index = i
                 break
 
-        print("chapter index " + str(chapter_index))
-        print("scene index " + str(scene_index))
+        #print("chapter index " + str(chapter_index))
+        #print("scene index " + str(scene_index))
 
         prompt = "{{[INPUT]}}\nYou are to take the role of an author writing a story. The story is titled \"" + story.title.text() + "\"."
         if len(story.summary.toPlainText()) > 0:
@@ -356,7 +359,6 @@ class StoryWriter(QWidget):
         
         layout.addWidget(self.scrollArea)
 
-
         self.buttonsLayout = QHBoxLayout()
 
         self.new_chapter_button = QPushButton('Add a new Chapter')
@@ -436,9 +438,7 @@ class StoryWriter(QWidget):
                     f.write(scene.text.toPlainText())
                     f.write("\n\n")
 
-
-# Create a Qt application
-app = QApplication([])
+                
 
 # Create and show the form
 form = StoryWriter()
