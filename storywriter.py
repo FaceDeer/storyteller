@@ -4,6 +4,9 @@ import re
 import sys
 
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QFormLayout, QGridLayout, QFileDialog, QFrame, QScrollArea, QSizePolicy
+from PyQt5.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QFocusEvent
+import queue
 
 def excepthook(exc_type, exc_value, exc_tb):
     tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
@@ -17,6 +20,10 @@ app = QApplication([])
 
 exportedStylesheet = "background-color: rgb(252, 245, 229);"
 
+
+####################################
+## API access
+
 # Define the URL
 generateUrl = "http://localhost:5001/api/v1/generate"
 tokenCountUrl = "http://localhost:5001/api/extra/tokencount"
@@ -26,42 +33,132 @@ headers = {
     'Content-Type': 'application/json'
 }
 
-def getPromptJson(prompt, grammar):
-    data = {
-        "prompt": prompt,
-        "max_length": 1024
-        #"stop_sequence": "</s>"
-    }
-    if grammar:
-        data["grammar"] = grammar
-    return json.dumps(data)
+class CountTask(QObject):
+    def __init__(self, data, source):
+        super(CountTask, self).__init__()
+        self.data = data
+        self.source = source
+    def execute(self):
+        response = requests.post(tokenCountUrl, headers=headers, data=json.dumps({"prompt":self.data}))
+        if response.status_code == 200:
+            response_data = json.loads(response.text)
+            self.source.onTokensCounted(response_data["value"])
+        else:
+            self.source.onTokensCounted(-1)
 
-def getResult(prompt, grammar):
-    # Send the request and get the response
-    response = requests.post(generateUrl, headers=headers, data=getPromptJson(prompt, grammar))
-    # Check if the request was successful
-    if response.status_code == 200:
-        # Parse the response JSON into a Python dictionary
-        response_data = json.loads(response.text)
-        #print(response_data)
-        app.beep()
-        return response_data["results"][0]["text"].strip()
-    else:
-        print(f"Request failed with status code {response.status_code}")
-        return False
+class GenerateTask(QObject):
+    def __init__(self, data, source):
+        super(GenerateTask, self).__init__()
+        self.data = data
+        self.source = source
+    def execute(self):
+        prompt = json.dumps({
+            "prompt": self.data,
+            "max_length": 1024
+        })
+        response = requests.post(generateUrl, headers=headers, data=prompt)
+        if response.status_code == 200:
+            response_data = json.loads(response.text)
+            app.beep()
+            self.source.onResponseGenerated(response_data["results"][0]["text"].strip())
+        else:
+            self.source.onResponseGenerated("Error generating response")       
 
-def countTokens(prompt):
-    response = requests.post(tokenCountUrl, headers=headers, data=json.dumps({"prompt":prompt}))
-    if response.status_code == 200:
-        # Parse the response JSON into a Python dictionary
-        response_data = json.loads(response.text)
-        print(response_data)
+class Worker(QObject):
+    finished = pyqtSignal()
 
-def sanitize_filename(filename):
-    return re.sub(r'(?u)[^-\w.]', '_', filename)
+    def __init__(self):
+        super(Worker, self).__init__()
+        self.tasks = queue.Queue()
+
+    @pyqtSlot(QObject)
+    def addTask(self, task):
+        self.tasks.put(task)
+        if not global_thread.isRunning():
+            global_thread.start() #There seems to be a race condition preventing this from restarting the thread
+            #when counting tokens on a freshly-generated scene text. I'll fix it later, this is a minor issue for now.
+
+    @pyqtSlot()
+    def processNextTask(self):
+        if not self.tasks.empty():
+            task = self.tasks.get()
+            task.execute()
+            self.processNextTask()
+        else:
+            self.finished.emit()
+
+# Global worker and thread
+global_thread = QThread()
+global_worker = Worker()
+global_worker.moveToThread(global_thread)
+global_thread.started.connect(global_worker.processNextTask)
+global_worker.finished.connect(global_thread.quit)
+
+#####################################
+## UI
+
+
+class CustomTextEdit(QTextEdit):
+    def __init__(self, parent=None):
+        super(CustomTextEdit, self).__init__(parent)
+        self.parent = parent
+    def focusOutEvent(self, event: QFocusEvent) -> None:
+        if self.CustomTextEdit_oldText != self.toPlainText():
+            self.CustomTextEdit_oldText = self.toPlainText()
+            self.parent.updateTokens()
+        super().focusOutEvent(event)
+    def focusInEvent(self, event: QFocusEvent) -> None:
+        self.CustomTextEdit_oldText = self.toPlainText()
+        super().focusInEvent(event)
+
+class TokenizedTextEdit(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+        self.tokenCountLabel = QLabel()
+        self.tokenCount = 0
+        self.textEdit = CustomTextEdit(self)
+        self.layout.addWidget(self.textEdit)
+        self.layout.addWidget(self.tokenCountLabel)
+
+    def setText(self, text):
+        if self.textEdit.getText() != text:
+            self.textEdit.setText(text)
+            self.updateTokens()
+    def setPlainText(self, text):
+        if self.textEdit.toPlainText() != text:
+            self.textEdit.setPlainText(text)
+            self.updateTokens()
+    def setPlaceholderText(self, text):
+        return self.textEdit.setPlaceholderText(text)
+    def getText(self):
+        return self.textEdit.getText()
+    def toPlainText(self):
+        return self.textEdit.toPlainText()
+
+    #Bypass token counting when we already know it or it's not relevant
+    #a negative token count triggers an update anyway
+    def setPlainTextAndTokens(self, text, tokens):
+        self.textEdit.setPlainText(text)
+        if tokens < 0:
+            self.updateTokens()
+        else:
+            self.onTokensCounted(tokens)
+
+    def onTokensCounted(self, count):
+        self.tokenCount = count
+        self.tokenCountLabel.setText("Tokens: " + str(self.tokenCount))
+
+    @pyqtSlot()
+    def updateTokens(self):
+        self.tokenCountLabel.setText("Counting tokens...")
+        task = CountTask(self.textEdit.toPlainText(), self)
+        global_worker.addTask(task)
 
 #Note to self: update Scene to have a root widget rather than adding things directly to its layout
 class Scene(QWidget):
+    sceneTextResponseReady = pyqtSignal(str)
     def __init__(self, parentChapter, sceneData=None):
         super().__init__()
         self.parentChapter = parentChapter
@@ -70,7 +167,7 @@ class Scene(QWidget):
         self.parentChapter.scenesLayout.addWidget(self)
 
         self.textLayout = QGridLayout()
-        self.summary = QTextEdit()
+        self.summary = TokenizedTextEdit()
         self.summary.setPlaceholderText("Scene Summary")
         self.summary.setMinimumHeight(100)
         self.textLayout.addWidget(QLabel("Scene Summary"),0,0)
@@ -79,10 +176,11 @@ class Scene(QWidget):
         self.summary.setToolTip("""This text is sent to the LLM to tell it what this scene is supposed to depict.
 It is also used when generating later scenes in this chapter as part of the summary of how the chapter has progressed to this point.""")
 
-        self.text = QTextEdit()
+        self.text = TokenizedTextEdit()
         self.text.setPlaceholderText("Text")
         self.text.setStyleSheet(exportedStylesheet)
         self.text.setToolTip("""This is the finished output text for this story.""")
+        self.sceneTextResponseReady.connect(self.updateText)
 
         self.textLayout.addWidget(QLabel("Text"),0,1)
         self.textLayout.addWidget(self.text,1,1)
@@ -109,8 +207,8 @@ It is also used when generating later scenes in this chapter as part of the summ
         self.layout.addLayout(buttons)
 
         if sceneData:
-            self.summary.setPlainText(sceneData["summary"])
-            self.text.setPlainText(sceneData["text"])
+            self.summary.setPlainTextAndTokens(sceneData["summary"], int(sceneData.get("summaryTokens", -1)))
+            self.text.setPlainTextAndTokens(sceneData["text"], int(sceneData.get("textTokens", -1)))
 
     def deleteScene(self):
         self.parentChapter.scenesLayout.removeWidget(self)
@@ -154,8 +252,15 @@ It is also used when generating later scenes in this chapter as part of the summ
                  + "\n\nPlease write out this scene.\n{{[OUTPUT]}}"
 
         print(prompt)
-        self.text.setPlainText(getResult(prompt, None))
-        return
+
+        task = GenerateTask(prompt, self)
+        global_worker.addTask(task)
+        self.text.setPlainTextAndTokens("Generating...", 0)
+
+    def onResponseGenerated(self, response):
+        self.sceneTextResponseReady.emit(response) # PyQt can't handle updates to the UI from other threads, need to route it through a signal
+    def updateText(self, response):
+        self.text.setPlainText(response)
 
     def moveScene(self, up):
         chapter = self.parentChapter
@@ -182,7 +287,6 @@ It is also used when generating later scenes in this chapter as part of the summ
         layout.insertWidget(scene_index, widget2)
         layout.insertWidget(target, widget1)
         chapter.update()
-        return    
 
     def moveSceneUp(self):
         self.moveScene(True)
@@ -190,6 +294,7 @@ It is also used when generating later scenes in this chapter as part of the summ
         self.moveScene(False)
 
 class Chapter(QFrame):
+    chapterSummaryTextResponseReady = pyqtSignal(str)
     def __init__(self, parentStory, chapterData=None):
         super().__init__()
         self.setFrameShape(QFrame.Box)
@@ -207,7 +312,7 @@ class Chapter(QFrame):
 
         self.layout.addLayout(title)
 
-        self.summary = QTextEdit()
+        self.summary = TokenizedTextEdit()
         self.summary.setPlaceholderText('Previous Chapter Summary')
         self.summary.setMinimumHeight(100)
         self.summary.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -226,6 +331,7 @@ class Chapter(QFrame):
 Adding a summary of the "previous chapter" to the first chapter can be useful to provide background information that may not be relevant later in the story,
 such as a description of how the characters got into the initial situation they first find themselves in.
 You can use the AI to automatically generate a summary of the previous chapter's text, but it's good to review and edit it to ensure it focuses on what you consider important.""")
+        self.chapterSummaryTextResponseReady.connect(self.updateSummaryText)
         
         self.layout.addWidget(summaryContainer)
 
@@ -251,7 +357,7 @@ You can use the AI to automatically generate a summary of the previous chapter's
 
         if chapterData:
             self.title.setText(chapterData["title"])
-            self.summary.setPlainText(chapterData["summary"])
+            self.summary.setPlainTextAndTokens(chapterData["summary"], int(chapterData.get("summaryTokens", -1)))
             for sceneData in chapterData["scenes"]:
                 Scene(self, sceneData)
 
@@ -294,8 +400,21 @@ You can use the AI to automatically generate a summary of the previous chapter's
         prompt = prompt + "\n\nPlease summarize this chapter in 200 words or less, focusing on the information that's important for writing future scenes in this story.\n{{[OUTPUT]}}"
 
         print(prompt)
-        chapter.summary.setPlainText(getResult(prompt, None))
-        return
+
+        task = GenerateTask(prompt, self)
+        global_worker.addTask(task)
+        self.summary.setPlainTextAndTokens("Generating...", 0)
+
+    def onResponseGenerated(self, response):
+        self.chapterSummaryTextResponseReady.emit(response) # PyQt can't handle updates to the UI from other threads, need to route it through a signal
+
+    def updateSummaryText(self, response):
+        self.summary.setPlainText(response)
+
+
+
+def sanitize_filename(filename):
+    return re.sub(r'(?u)[^-\w.]', '_', filename)
 
 class StoryWriter(QWidget):
     def __init__(self):
@@ -314,7 +433,7 @@ class StoryWriter(QWidget):
 
         summary = QWidget()
         summaryLayout = QFormLayout()
-        self.summary = QTextEdit()
+        self.summary = TokenizedTextEdit()
         self.summary.setPlaceholderText('Background Information')
         summaryLayout.addRow("Background\nInformation", self.summary)
         summary.setLayout(summaryLayout)
@@ -370,7 +489,7 @@ class StoryWriter(QWidget):
             jsonData = json.load(f)
         if jsonData is None:
             return
-        self.summary.setPlainText(jsonData["summary"])
+        self.summary.setPlainTextAndTokens(jsonData.get("summary", ""), int(jsonData.get("summaryTokens", -1)))
         self.title.setText(jsonData["title"])
         for widget in self.scrollContent.findChildren(QWidget):
             widget.deleteLater()
@@ -383,6 +502,7 @@ class StoryWriter(QWidget):
         jsonData = {}
         jsonData["title"] = self.title.text()
         jsonData["summary"] = self.summary.toPlainText()
+        jsonData["summaryTokens"] = self.summary.tokenCount
         jsonData["chapters"] = []
         for i in range(self.chapterLayout.count()):
             chapter = self.chapterLayout.itemAt(i).widget()
@@ -390,13 +510,16 @@ class StoryWriter(QWidget):
             jsonData["chapters"].append(chapterData)
             chapterData["title"] = chapter.title.text()
             chapterData["summary"] = chapter.summary.toPlainText()
+            chapterData["summaryTokens"] = chapter.summary.tokenCount
             chapterData["scenes"] = []
             for i in range(chapter.scenesLayout.count()):
                 scene = chapter.scenesLayout.itemAt(i).widget()
                 sceneData = {}
                 chapterData["scenes"].append(sceneData)
                 sceneData["summary"] = scene.summary.toPlainText()
+                sceneData["summaryTokens"] = scene.summary.tokenCount
                 sceneData["text"] = scene.text.toPlainText()
+                sceneData["textTokens"] = scene.text.tokenCount
         
         with open(filename + ".json", "w") as f:
             f.write(json.dumps(jsonData))
@@ -415,9 +538,7 @@ class StoryWriter(QWidget):
                 for i in range(chapter.scenesLayout.count()):
                     scene = chapter.scenesLayout.itemAt(i).widget()
                     f.write(scene.text.toPlainText())
-                    f.write("\n\n")
-
-                
+                    f.write("\n\n")             
 
 # Create and show the form
 form = StoryWriter()
